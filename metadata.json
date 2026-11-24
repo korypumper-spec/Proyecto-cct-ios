@@ -1,0 +1,8 @@
+{
+  "name": "Buscador Normativo IMSS–SNTSS",
+  "description": "Buscador jurídico-laboral de alta precisión sobre el Contrato Colectivo de Trabajo 2025–2027 y los Estatutos del SNTSS, con ubicación exacta de artículo, sección, reglamento, subsección y página.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

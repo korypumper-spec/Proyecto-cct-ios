@@ -1,0 +1,304 @@
+name: Build iOS App (Signed / Unsigned IPA + Simulator)
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_mode:
+        description: 'Modo de compilación iOS (auto detecta certificados en Secrets)'
+        required: false
+        default: 'auto'
+        type: choice
+        options:
+          - auto
+          - signed
+          - unsigned
+      export_method:
+        description: 'Método de exportación para compilación firmada'
+        required: false
+        default: 'auto'
+        type: choice
+        options:
+          - auto
+          - ad-hoc
+          - app-store-connect
+          - development
+  push:
+    branches: [main, master]
+
+jobs:
+  build-ios:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Inspect macOS and Xcode toolchain
+        run: |
+          sw_vers
+          xcodebuild -version
+          swift --version
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install npm dependencies
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install
+          fi
+
+      - name: Ensure offline database bundle and Safari/iOS PDF worker
+        run: |
+          if [ ! -f public/data/normativa-offline.json ]; then
+            npm run ingest
+            npm run export:offline
+          fi
+          cp node_modules/pdfjs-dist/legacy/build/pdf.worker.min.mjs public/pdf.worker.min.mjs
+
+      - name: TypeScript check, Vite build and Capacitor iOS sync
+        run: |
+          npm run lint
+          npm run build
+          npx cap sync ios
+
+      - name: Verify complete offline bundle inside iOS app target
+        run: |
+          test -f ios/App/App/public/index.html
+          test -f ios/App/App/public/data/normativa-offline.json
+          test -f ios/App/App/public/pdf.worker.min.mjs
+          test -f ios/App/App/public/assets/aistudio/CCT_2025-2027_6a8763f8.pdf
+          test -f ios/App/App/public/assets/aistudio/estatutos-sntss-rcci-image_9b29b255.pdf
+          ls -lh ios/App/App/public/data/normativa-offline.json ios/App/App/public/pdf.worker.min.mjs
+
+      - name: Cache Swift Package Manager dependencies
+        uses: actions/cache@v4
+        with:
+          path: ios/App/.spm-cache
+          key: ${{ runner.os }}-spm-${{ hashFiles('ios/App/CapApp-SPM/Package.swift') }}
+          restore-keys: |
+            ${{ runner.os }}-spm-
+
+      - name: Resolve Swift Package Manager dependencies
+        working-directory: ios/App
+        run: |
+          xcodebuild \
+            -resolvePackageDependencies \
+            -project App.xcodeproj \
+            -scheme App \
+            -clonedSourcePackagesDirPath "$PWD/.spm-cache"
+
+      - name: Determine iOS signing mode
+        id: mode
+        env:
+          INPUT_MODE: ${{ github.event.inputs.build_mode || 'auto' }}
+          HAS_CERT: ${{ secrets.APPLE_CERTIFICATE_BASE64 != '' }}
+          HAS_PASS: ${{ secrets.APPLE_CERTIFICATE_PASSWORD != '' }}
+          HAS_PROFILE: ${{ secrets.APPLE_PROVISIONING_PROFILE_BASE64 != '' }}
+        run: |
+          if [ "$INPUT_MODE" = "signed" ]; then
+            if [ "$HAS_CERT" != "true" ] || [ "$HAS_PASS" != "true" ] || [ "$HAS_PROFILE" != "true" ]; then
+              echo "::error::Modo 'signed' seleccionado pero faltan secrets (APPLE_CERTIFICATE_BASE64, APPLE_CERTIFICATE_PASSWORD, APPLE_PROVISIONING_PROFILE_BASE64)."
+              exit 1
+            fi
+            echo "signed=true" >> "$GITHUB_OUTPUT"
+          elif [ "$INPUT_MODE" = "auto" ] && [ "$HAS_CERT" = "true" ] && [ "$HAS_PASS" = "true" ] && [ "$HAS_PROFILE" = "true" ]; then
+            echo "signed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Setup Apple signing certificate and provisioning profile (Signed mode)
+        if: steps.mode.outputs.signed == 'true'
+        id: signing
+        env:
+          CERT_B64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          CERT_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          PROFILE_B64: ${{ secrets.APPLE_PROVISIONING_PROFILE_BASE64 }}
+          TEAM_OVERRIDE: ${{ secrets.APPLE_TEAM_ID }}
+          EXPORT_INPUT: ${{ github.event.inputs.export_method || 'auto' }}
+          EXPORT_SECRET: ${{ secrets.APPLE_EXPORT_METHOD }}
+        run: |
+          KEYCHAIN_PATH="$RUNNER_TEMP/ios-build.keychain-db"
+          KEYCHAIN_PASS="$(openssl rand -hex 24)"
+          CERT_PATH="$RUNNER_TEMP/cert.p12"
+          PROFILE_TMP="$RUNNER_TEMP/profile.mobileprovision"
+          PROFILE_PLIST="$RUNNER_TEMP/profile.plist"
+
+          python3 -c 'import base64,os,sys; sys.stdout.buffer.write(base64.b64decode(os.environ["CERT_B64"]))' > "$CERT_PATH"
+          python3 -c 'import base64,os,sys; sys.stdout.buffer.write(base64.b64decode(os.environ["PROFILE_B64"]))' > "$PROFILE_TMP"
+
+          security create-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
+          security import "$CERT_PATH" -P "$CERT_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH" login.keychain-db
+
+          IDENTITY_HASH="$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" | awk '/1\)/{print $2; exit}')"
+          if [ -z "$IDENTITY_HASH" ]; then
+            echo "::error::No se encontró identidad de firma válida dentro del certificado .p12."
+            exit 1
+          fi
+
+          security cms -D -i "$PROFILE_TMP" > "$PROFILE_PLIST"
+          PROFILE_UUID="$(/usr/libexec/PlistBuddy -c 'Print :UUID' "$PROFILE_PLIST")"
+          TEAM_FROM_PROFILE="$(/usr/libexec/PlistBuddy -c 'Print :TeamIdentifier:0' "$PROFILE_PLIST")"
+          TEAM_ID="${TEAM_OVERRIDE:-$TEAM_FROM_PROFILE}"
+
+          mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
+          PROFILE_DEST="$HOME/Library/MobileDevice/Provisioning Profiles/${PROFILE_UUID}.mobileprovision"
+          cp "$PROFILE_TMP" "$PROFILE_DEST"
+
+          METHOD="$EXPORT_INPUT"
+          if [ "$METHOD" = "auto" ]; then
+            if [ -n "$EXPORT_SECRET" ]; then
+              METHOD="$EXPORT_SECRET"
+            elif /usr/libexec/PlistBuddy -c 'Print :ProvisionedDevices' "$PROFILE_PLIST" >/dev/null 2>&1; then
+              GET_TASK_ALLOW="$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:get-task-allow' "$PROFILE_PLIST" 2>/dev/null || echo false)"
+              if [ "$GET_TASK_ALLOW" = "true" ]; then
+                METHOD="development"
+              else
+                METHOD="ad-hoc"
+              fi
+            else
+              METHOD="app-store-connect"
+            fi
+          fi
+
+          echo "keychain_path=$KEYCHAIN_PATH" >> "$GITHUB_OUTPUT"
+          echo "profile_dest=$PROFILE_DEST" >> "$GITHUB_OUTPUT"
+          echo "identity_hash=$IDENTITY_HASH" >> "$GITHUB_OUTPUT"
+          echo "profile_uuid=$PROFILE_UUID" >> "$GITHUB_OUTPUT"
+          echo "team_id=$TEAM_ID" >> "$GITHUB_OUTPUT"
+          echo "export_method=$METHOD" >> "$GITHUB_OUTPUT"
+
+      - name: Build and export signed iOS IPA (Release)
+        if: steps.mode.outputs.signed == 'true'
+        working-directory: ios/App
+        run: |
+          mkdir -p build/export
+          xcodebuild \
+            -project App.xcodeproj \
+            -scheme App \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -clonedSourcePackagesDirPath "$PWD/.spm-cache" \
+            -archivePath "$PWD/build/App.xcarchive" \
+            CODE_SIGN_STYLE=Manual \
+            CODE_SIGN_IDENTITY="${{ steps.signing.outputs.identity_hash }}" \
+            DEVELOPMENT_TEAM="${{ steps.signing.outputs.team_id }}" \
+            PROVISIONING_PROFILE_SPECIFIER="${{ steps.signing.outputs.profile_uuid }}" \
+            archive
+
+          cat > build/ExportOptions.plist <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key>
+            <string>${{ steps.signing.outputs.export_method }}</string>
+            <key>teamID</key>
+            <string>${{ steps.signing.outputs.team_id }}</string>
+            <key>signingStyle</key>
+            <string>manual</string>
+            <key>compileBitcode</key>
+            <false/>
+            <key>provisioningProfiles</key>
+            <dict>
+              <key>mx.org.sntss.normativa</key>
+              <string>${{ steps.signing.outputs.profile_uuid }}</string>
+            </dict>
+          </dict>
+          </plist>
+          PLIST
+
+          xcodebuild \
+            -exportArchive \
+            -archivePath "$PWD/build/App.xcarchive" \
+            -exportOptionsPlist "$PWD/build/ExportOptions.plist" \
+            -exportPath "$PWD/build/export"
+
+          IPA_FILE="$(find build/export -maxdepth 1 -name '*.ipa' | head -n 1)"
+          cp "$IPA_FILE" "normativa-imss-sntss-offline-signed.ipa"
+
+      - name: Archive unsigned iOS IPA (ARM64 Release)
+        if: steps.mode.outputs.signed == 'false'
+        working-directory: ios/App
+        run: |
+          xcodebuild \
+            -project App.xcodeproj \
+            -scheme App \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -clonedSourcePackagesDirPath "$PWD/.spm-cache" \
+            -archivePath "$PWD/build/App.xcarchive" \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGN_STYLE=Manual \
+            DEVELOPMENT_TEAM="" \
+            PROVISIONING_PROFILE_SPECIFIER="" \
+            archive
+
+          rm -rf Payload
+          mkdir -p Payload
+          cp -R build/App.xcarchive/Products/Applications/App.app Payload/
+          zip -qry normativa-imss-sntss-offline-unsigned.ipa Payload
+
+      - name: Build iOS Simulator app bundle for verification
+        working-directory: ios/App
+        run: |
+          xcodebuild \
+            -project App.xcodeproj \
+            -scheme App \
+            -configuration Release \
+            -sdk iphonesimulator \
+            -destination 'generic/platform=iOS Simulator' \
+            -clonedSourcePackagesDirPath "$PWD/.spm-cache" \
+            -derivedDataPath "$PWD/build/SimDerivedData" \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+
+          mkdir -p build/sim-export
+          (cd build/SimDerivedData/Build/Products/Release-iphonesimulator && zip -qry "$OLDPWD/build/sim-export/normativa-imss-sntss-ios-simulator.app.zip" App.app)
+
+      - name: Cleanup temporary keychain and signing files
+        if: always() && steps.mode.outputs.signed == 'true'
+        run: |
+          if [ -n "${{ steps.signing.outputs.keychain_path }}" ]; then
+            security delete-keychain "${{ steps.signing.outputs.keychain_path }}" || true
+          fi
+          if [ -n "${{ steps.signing.outputs.profile_dest }}" ]; then
+            rm -f "${{ steps.signing.outputs.profile_dest }}" || true
+          fi
+          rm -f "$RUNNER_TEMP/cert.p12" "$RUNNER_TEMP/profile.mobileprovision" "$RUNNER_TEMP/profile.plist" || true
+
+      - name: Upload Signed iOS IPA
+        if: steps.mode.outputs.signed == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: normativa-imss-sntss-offline-ios-signed-ipa
+          path: ios/App/normativa-imss-sntss-offline-signed.ipa
+
+      - name: Upload Unsigned iOS IPA
+        if: steps.mode.outputs.signed == 'false'
+        uses: actions/upload-artifact@v4
+        with:
+          name: normativa-imss-sntss-offline-ios-unsigned-ipa
+          path: ios/App/normativa-imss-sntss-offline-unsigned.ipa
+
+      - name: Upload iOS Simulator App Bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: normativa-imss-sntss-ios-simulator-app
+          path: ios/App/build/sim-export/normativa-imss-sntss-ios-simulator.app.zip
